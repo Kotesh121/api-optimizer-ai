@@ -1,71 +1,112 @@
-name: API Optimizer AI CI/CD Pipeline
+name: Deploy API Optimizer AI
 
 on:
   push:
-    branches: [ "main" ]
-  pull_request:
-    branches: [ "main" ]
+    branches:
+      - main
 
 jobs:
-  # 1. Backend Test & Verification Job
-  backend-test:
-    name: 🐍 FastAPI Backend Build & Test
+
+  deploy:
     runs-on: ubuntu-latest
 
     steps:
-    - name: Checkout Code
-      uses: actions/checkout@v4
 
-    - name: Set up Python 3.13
-      uses: actions/setup-python@v5
-      with:
-        python-version: "3.13"
+      - name: Checkout repository
+        uses: actions/checkout@v4
 
-    - name: Install Dependencies
-      run: |
-        python -m pip install --upgrade pip
-        pip install -r requirements.txt
-        pip install pytest httpx
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
 
-    - name: Run Backend Test Suite
-      env:
-        PYTHONPATH: .
-      run: |
-        python scratch/test_sprint8.py
+      - name: Install frontend dependencies
+        working-directory: frontend
+        run: npm ci
 
-  # 2. Frontend Build Verification Job
-  frontend-build:
-    name: ⚛️ React Frontend Build Verification
-    runs-on: ubuntu-latest
+      - name: Build frontend
+        working-directory: frontend
+        run: npm run build
 
-    steps:
-    - name: Checkout Code
-      uses: actions/checkout@v4
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.13'
 
-    - name: Set up Node.js 22
-      uses: actions/setup-node@v4
-      with:
-        node-version: "22"
+      - name: Validate backend dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
 
-    - name: Install React Dependencies & Build
-      env:
-        CI: "false"
-        DISABLE_ESLINT_PLUGIN: "true"
-      run: |
-        cd frontend
-        npm ci --legacy-peer-deps || npm install --legacy-peer-deps
-        DISABLE_ESLINT_PLUGIN=true CI=false npm run build
+      - name: Validate Docker Compose
+        run: |
+          docker compose config
 
-  # 3. Docker Compose Verification Job
-  docker-build:
-    name: 🐳 Docker Container Build Validation
-    runs-on: ubuntu-latest
-    needs: [backend-test, frontend-build]
+      - name: Build Docker images
+        run: |
+          docker compose build
 
-    steps:
-    - name: Checkout Code
-      uses: actions/checkout@v4
+      - name: Configure SSH
+        run: |
+          mkdir -p ~/.ssh
+          echo "${{ secrets.EC2_SSH_KEY }}" > ~/.ssh/api_optimizer_key
+          chmod 600 ~/.ssh/api_optimizer_key
 
-    - name: Validate Docker Compose Configuration
-      run: |
-        docker compose config
+          ssh-keyscan -H "${{ secrets.EC2_HOST }}" >> ~/.ssh/known_hosts
+
+      - name: Deploy to EC2
+        run: |
+          ssh \
+            -i ~/.ssh/api_optimizer_key \
+            ${{ secrets.EC2_USER }}@${{ secrets.EC2_HOST }} << 'EOF'
+
+            set -e
+
+            cd /opt/api-optimizer-ai
+
+            echo "Pulling latest source..."
+            git fetch origin
+            git reset --hard origin/main
+
+            echo "Checking Docker..."
+            docker --version
+            docker compose version
+
+            echo "Validating Compose..."
+            docker compose config
+
+            echo "Creating database backup..."
+            mkdir -p /opt/api-optimizer-backups
+
+            docker exec api_optimizer_db \
+              mysqldump \
+              -uapi_user \
+              -p"${MYSQL_PASSWORD}" \
+              api_optimizer_db \
+              | gzip > \
+[<32;7;3M              /opt/api-optimizer-backups/pre_deploy_$(date +%F_%H-%M-%S).sql.gz || true
+[<32;7;4M
+            echo "Building containers..."
+            docker compose build
+
+            echo "Starting containers..."
+            docker compose up -d
+
+            echo "Waiting for services..."
+            sleep 20
+
+[<32;8;4M            echo "Container status..."
+            docker compose ps
+[<32;9;4M
+            echo "Backend health..."
+            docker exec api_optimizer_backend \
+              curl -f http://localhost:8000/health
+[<32;10;4M
+[<32;10;5M            echo "Frontend health..."
+            curl -f http://localhost/health
+[<32;11;5M
+            echo "Deployment successful."
+
+          EOF
